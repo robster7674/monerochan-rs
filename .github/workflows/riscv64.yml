@@ -1,0 +1,117 @@
+name: riscv64
+
+# Native riscv64 build and test on the RISE RISC-V runners (https://ci.riseproject.dev/).
+# Needs the RISE GitHub App installed on the repo, otherwise the job stays queued,
+# so PR runs are gated on the RISCV_RUNNERS repo variable being "true".
+#
+# The monerochan toolchain that compiles guest programs is only published for x86_64 and
+# aarch64 hosts. Guest ELFs don't depend on the host, so they are built on x86-64 and handed
+# to the riscv64 job, which builds the host crates with MONEROCHAN_SKIP_PROGRAM_BUILD=true.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/riscv64.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest-elfs:
+    name: Build guest ELFs (x86-64)
+    if: vars.RISCV_RUNNERS == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      - name: Install MONEROCHAN toolchain
+        run: cargo run --release -p monerochan-cli -- monerochan install-toolchain
+
+      # Build scripts run under `cargo check`, which is enough to compile the guest programs.
+      - name: Build test-artifacts guest programs
+        run: cargo check --release -p test-artifacts
+
+      - name: Pack ELFs
+        run: |
+          find . -type d -name elf-compilation -prune -print
+          find . -path '*/elf-compilation/riscv32im-succinct-zkvm-elf/release/*' -type f -perm -u+x -print0 \
+            | tar --null -czvf guest-elfs.tar.gz -T -
+
+      - name: Upload ELFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-elfs
+          path: guest-elfs.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  test-riscv64:
+    name: Build and test (riscv64)
+    needs: guest-elfs
+    runs-on: ubuntu-24.04-riscv
+    # The runners are slow (4-core boards) and run one job per node
+    timeout-minutes: 600
+    env:
+      MONEROCHAN_SKIP_PROGRAM_BUILD: "true"
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler cmake clang libclang-dev m4 time git curl
+
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Print machine and toolchain info
+        run: |
+          uname -a
+          nproc
+          free -h
+          cat /proc/cpuinfo | grep -m1 -E 'isa|uarch' || true
+          rustc -vV
+          cargo -V
+
+      - name: Download ELFs
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-elfs
+
+      - name: Unpack ELFs
+        run: tar -xzvf guest-elfs.tar.gz
+
+      - name: Build SDK tests
+        run: cargo test --release --locked -p monerochan-sdk --lib --no-run
+
+      - name: Execute (fibonacci, hello world, panic, cycle limit)
+        run: |
+          cargo test --release --locked -p monerochan-sdk --lib -- \
+            tests::test_execute tests::test_execute_panic tests::test_cycle_limit_fail tests::test_e2e_io_override
+
+      - name: Core proof, prove and verify (fibonacci)
+        run: /usr/bin/time -v cargo test --release --locked -p monerochan-sdk --lib -- --exact tests::test_e2e_core
+
+      - name: Compressed proof, prove and verify (fibonacci)
+        # Recursion needs a lot of memory and time; report but don't fail the job on it.
+        continue-on-error: true
+        run: /usr/bin/time -v cargo test --release --locked -p monerochan-sdk --lib -- --exact tests::test_e2e_compressed
